@@ -14,9 +14,9 @@ Build aus dem Projektverzeichnis unter Linux:
 
     ./Build.sh
 
-Artefakt:
+Artefakt relativ zum Workspace-Root:
 
-    zig-out\HIDREPORT.R4P
+    Artifacts/Modules/UsbHidReport/HIDREPORT.R4P
 
 Manifest:
 
