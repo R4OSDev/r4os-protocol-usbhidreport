@@ -10,4 +10,8 @@ pub fn build(b: *std.Build) void {
     const sdk_dep = b.dependencyFromBuildZig(sdk_build, .{});
     const sdk = sdk_build.sdk(b, sdk_dep, .{});
     _ = sdk.addR4MF(b.path("module.R4MF"));
+    const host = b.createModule(.{ .root_source_file = b.path("src/main.zig"), .target = b.graph.host, .optimize = .ReleaseSafe });
+    host.addImport("r4os", sdk.createR4osModule(b.graph.host, .ReleaseSafe));
+    const tests = b.addTest(.{ .root_module = host });
+    b.step("test", "Bounded descriptor and consumer input semantics").dependOn(&b.addRunArtifact(tests).step);
 }

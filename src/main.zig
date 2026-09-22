@@ -1,4 +1,7 @@
 const r4os = @import("r4os");
+test "HID consumer reports preserve IDs, directions, bounds and field kinds" {
+    try @import("consumer_test.zig").check(parseDescriptor);
+}
 
 const MAX_FIELDS: usize = r4os.abi.hid_report_max_fields;
 const MAX_FIELD_USAGES: usize = r4os.abi.hid_report_max_field_usages;
@@ -37,7 +40,7 @@ const LocalState = struct {
 };
 
 comptime {
-    asm (r4os.r4dev.protocolEntriesAsm("usbhidr_init", "usbhidr_shutdown", "usbhidr_query", "usbhidr_dispatch"));
+    if (!@import("builtin").is_test) asm (r4os.r4dev.protocolEntriesAsm("usbhidr_init", "usbhidr_shutdown", "usbhidr_query", "usbhidr_dispatch"));
 }
 
 export fn usbhidr_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
@@ -65,6 +68,11 @@ export fn usbhidr_query(out: *r4os.abi.ProtocolStatus) callconv(.c) i32 {
 
 export fn usbhidr_dispatch(op: u32, in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) callconv(.c) i32 {
     _ = out_buffer;
+    if (op == r4os.abi.hid_report_op_consumer) {
+        const data = in_buffer.data orelse return -2;
+        if (in_buffer.len < @sizeOf(r4os.abi.HidConsumerOp) or in_buffer.capacity < in_buffer.len or @intFromPtr(data) % @alignOf(r4os.abi.HidConsumerOp) != 0) return -2;
+        return @import("consumer.zig").decode(@ptrCast(@alignCast(data)));
+    }
     const request = requestFromBuffer(in_buffer) orelse return -2;
     switch (op) {
         r4os.abi.hid_report_op_parse => parseOp(request),
@@ -107,6 +115,10 @@ fn parseDescriptor(bytes: []const u8) r4os.abi.HidReportSummary {
     var local: LocalState = .{};
     var report_id_seen: [16]bool = .{false} ** 16;
     var bit_offsets: [16]u16 = .{0} ** 16;
+    var other_offsets: [2][16]u16 = @splat(@splat(0));
+    var stack: [8]GlobalState = undefined;
+    var stack_count: usize = 0;
+    var collection_depth: usize = 0;
     var i: usize = 0;
     while (i < bytes.len) {
         const prefix = bytes[i];
@@ -116,8 +128,7 @@ fn parseDescriptor(bytes: []const u8) r4os.abi.HidReportSummary {
             const size = bytes[i];
             i += 2;
             if (i + size > bytes.len) return malformed(summary, r4os.abi.hid_report_reason_truncated_long_payload);
-            i += size;
-            continue;
+            return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
         }
 
         const size_code = prefix & 0x03;
@@ -143,45 +154,60 @@ fn parseDescriptor(bytes: []const u8) r4os.abi.HidReportSummary {
                     else => null,
                 };
                 if (kind) |field_kind| {
-                    addField(&summary, &global, &local, &bit_offsets, &report_id_seen, field_kind, @truncate(raw));
+                    if (global.report_count == 0 or global.report_size == 0 or global.report_id >= 16 or summary.field_count >= MAX_FIELDS)
+                        return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
+                    const offsets = if (field_kind == r4os.abi.hid_report_kind_input) &bit_offsets else &other_offsets[field_kind - 1];
+                    if (@as(u32, offsets[global.report_id]) + @as(u32, global.report_count) * global.report_size > 65535)
+                        return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
+                    addField(&summary, &global, &local, offsets, &report_id_seen, field_kind, @truncate(raw));
                     local.clear();
                 } else if (tag == 10 or tag == 12) {
+                    if (tag == 10) { collection_depth += 1; if (collection_depth > 32) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); }
+                    else { if (collection_depth == 0) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); collection_depth -= 1; }
                     local.clear();
                 }
             },
             1 => switch (tag) {
-                0 => global.usage_page = raw,
+                0 => { if (raw > 65535) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); global.usage_page = raw; },
                 1 => global.logical_min = signed,
-                2 => global.logical_max = signed,
-                7 => global.report_size = clampU8(raw),
+                2 => { if (global.logical_min >= 0 and raw > 0x7fffffff) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); global.logical_max = if (global.logical_min < 0) signed else @intCast(raw); },
+                7 => { if (raw > 255) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); global.report_size = @intCast(raw); },
                 8 => {
-                    global.report_id = clampU8(raw);
+                    if (raw == 0 or raw >= 16) return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
+                    global.report_id = @intCast(raw);
                     summary.has_report_id = 1;
                     markReportId(&summary, &report_id_seen, global.report_id);
                 },
-                9 => global.report_count = clampU8(raw),
+                9 => { if (raw > 255) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); global.report_count = @intCast(raw); },
+                10 => { if (stack_count == stack.len) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); stack[stack_count] = global; stack_count += 1; },
+                11 => { if (stack_count == 0) return malformed(summary, r4os.abi.hid_report_reason_not_parsed); stack_count -= 1; global = stack[stack_count]; },
                 else => {},
             },
             2 => switch (tag) {
                 0 => {
-                    local.addUsage(raw);
-                    markUsage(&summary, global.usage_page, raw);
+                    if (local.usage_count == MAX_FIELD_USAGES or (raw > 65535 and raw >> 16 != global.usage_page)) return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
+                    local.addUsage(raw & 65535);
+                    markUsage(&summary, global.usage_page, raw & 65535);
                 },
                 1 => {
-                    local.usage_min = raw;
+                    if (raw > 65535 and raw >> 16 != global.usage_page) return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
+                    local.usage_min = raw & 65535;
                     local.have_usage_min = true;
                     markUsage(&summary, global.usage_page, raw);
                 },
                 2 => {
-                    local.usage_max = raw;
+                    if (raw > 65535 and raw >> 16 != global.usage_page) return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
+                    local.usage_max = raw & 65535;
                     local.have_usage_max = true;
                     markUsage(&summary, global.usage_page, raw);
                 },
+                10 => return malformed(summary, r4os.abi.hid_report_reason_not_parsed), // alternate usage sets
                 else => {},
             },
             else => {},
         }
     }
+    if (stack_count != 0 or collection_depth != 0 or (summary.has_report_id != 0 and bit_offsets[0] != 0)) return malformed(summary, r4os.abi.hid_report_reason_not_parsed);
     summary.input_bits = bit_offsets;
     return summary;
 }
