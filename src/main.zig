@@ -40,15 +40,15 @@ const LocalState = struct {
 };
 
 comptime {
-    if (!@import("builtin").is_test) asm (r4os.r4dev.protocolEntriesAsm("usbhidr_init", "usbhidr_shutdown", "usbhidr_query", "usbhidr_dispatch"));
+    if (!@import("builtin").is_test) asm (r4os.technical2.protocolEntriesAsm("usbhidr_init", "usbhidr_shutdown", "usbhidr_query", "usbhidr_dispatch"));
 }
 
-export fn usbhidr_init(api: *const r4os.r4dev.ProtocolApi) callconv(.c) i32 {
-    var ctx = r4os.r4dev.ProtocolContext.init(api);
-    ctx.logInfo("HIDREPORT.R4P init");
-    _ = ctx.registerRole("usb.hid_report", .usb, 0);
-    _ = ctx.setStatus(.active, "HID report parser R4P active");
-    return 0;
+export fn usbhidr_init(api: *const r4os.r4dev.ProtocolApi2) callconv(.c) i32 {
+    const ctx = r4os.r4dev.ProtocolContext2.init(api);
+    if (!ctx.requires(.{ "register_role", "set_status" })) return r4os.abi.err_no_fn;
+    const registered = ctx.registerRole("usb.hid_report", .usb, 0);
+    if (registered != 0) return registered;
+    return ctx.setStatus(.active, "HID report parser R4P active");
 }
 
 export fn usbhidr_shutdown() callconv(.c) i32 {
@@ -69,9 +69,10 @@ export fn usbhidr_query(out: *r4os.abi.ProtocolStatus) callconv(.c) i32 {
 export fn usbhidr_dispatch(op: u32, in_buffer: *const r4os.abi.ProtocolBuffer, out_buffer: *r4os.abi.ProtocolBuffer) callconv(.c) i32 {
     _ = out_buffer;
     if (op == r4os.abi.hid_report_op_consumer) {
-        const data = in_buffer.data orelse return -2;
-        if (in_buffer.len < @sizeOf(r4os.abi.HidConsumerOp) or in_buffer.capacity < in_buffer.len or @intFromPtr(data) % @alignOf(r4os.abi.HidConsumerOp) != 0) return -2;
-        return @import("consumer.zig").decode(@ptrCast(@alignCast(data)));
+        const native = r4os.native_protocol_view;
+        var metadata = in_buffer.*;
+        const view = native.InOut(r4os.abi.HidConsumerOp).init(&metadata, native.Policy.versioned(r4os.abi.HidConsumerOp, 1, .inout, .prefix)) catch return -2;
+        return @import("consumer.zig").decode(view.value);
     }
     const request = requestFromBuffer(in_buffer) orelse return -2;
     switch (op) {
@@ -292,16 +293,22 @@ fn malformed(summary: r4os.abi.HidReportSummary, reason: u16) r4os.abi.HidReport
 }
 
 fn requestFromBuffer(buffer: *const r4os.abi.ProtocolBuffer) ?*r4os.abi.HidReportOp {
-    if (buffer.data == null) return null;
-    if (buffer.len < @sizeOf(r4os.abi.HidReportOp)) return null;
-    return @ptrCast(@alignCast(buffer.data.?));
+    const native = r4os.native_protocol_view;
+    // These original caller-owned operation records are not wire headers.
+    // Dispatch borrows them exclusively and never owns a USB transfer.
+    var metadata = buffer.*;
+    return (native.InOut(r4os.abi.HidReportOp).init(&metadata, native.Policy.record(r4os.abi.HidReportOp, .inout, .prefix)) catch return null).value;
 }
 
 fn readUnsigned(bytes: []const u8) u32 {
-    var value: u32 = 0;
-    var i: usize = 0;
-    while (i < bytes.len) : (i += 1) value |= @as(u32, bytes[i]) << @as(u5, @intCast(i * 8));
-    return value;
+    var reader = r4os.binary_cursor.Reader.init(bytes) catch unreachable;
+    return switch (bytes.len) {
+        0 => 0,
+        1 => reader.readInt(u8, .little) catch unreachable,
+        2 => reader.readInt(u16, .little) catch unreachable,
+        4 => reader.readInt(u32, .little) catch unreachable,
+        else => unreachable, // HID short-item sizes are exactly 0/1/2/4.
+    };
 }
 
 fn readSigned(bytes: []const u8) i32 {
